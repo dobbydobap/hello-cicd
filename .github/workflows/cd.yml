@@ -1,0 +1,99 @@
+name: CD Pipeline
+
+# Runs only after the CI pipeline has finished successfully on main,
+# so nothing gets published or deployed from code that failed its tests.
+on:
+  workflow_run:
+    workflows: ["Python CI Pipeline"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hello-cicd
+
+jobs:
+  publish:
+    name: Publish image to GHCR
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      sha: ${{ steps.vars.outputs.sha }}
+    steps:
+      - name: Checkout the commit that passed CI
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Work out the image tag
+        id: vars
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # GITHUB_TOKEN is a secret GitHub creates for every run; no extra setup needed
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: |
+          docker build -t "$IMAGE:${{ steps.vars.outputs.sha }}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${{ steps.vars.outputs.sha }}"
+          docker push "$IMAGE:latest"
+
+  deploy:
+    name: Deploy to Kubernetes
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      APP_API_KEY: ${{ secrets.APP_API_KEY }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      # a throwaway cluster on the runner, so every deploy is a real kubectl rollout
+      - name: Create a kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Check the API key secret is configured
+        run: |
+          if [ -z "$APP_API_KEY" ]; then
+            echo "::error::Repository secret APP_API_KEY is not set (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+          echo "APP_API_KEY is set (${#APP_API_KEY} characters). GitHub masks its value in these logs."
+
+      - name: Create Kubernetes secrets
+        run: |
+          kubectl create secret docker-registry ghcr-pull \
+            --docker-server=ghcr.io \
+            --docker-username="${{ github.actor }}" \
+            --docker-password="${{ secrets.GITHUB_TOKEN }}"
+          kubectl create secret generic hello-cicd-secrets --from-literal=api-key="$APP_API_KEY"
+
+      - name: Deploy
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|$IMAGE:${{ needs.publish.outputs.sha }}|; s|VERSION_PLACEHOLDER|${{ needs.publish.outputs.sha }}|" k8s/deployment.yaml
+          kubectl apply -f k8s/
+          kubectl rollout status deployment/hello-cicd --timeout=180s
+          kubectl get deploy,pods,svc -o wide
+
+      - name: Smoke test the deployment
+        run: |
+          kubectl port-forward svc/hello-cicd 8080:80 >/dev/null 2>&1 &
+          sleep 5
+          curl -sf localhost:8080/
+          echo
+          echo "without key: HTTP $(curl -s -o /dev/null -w '%{http_code}' 'localhost:8080/calc/add?a=2&b=3')"
+          curl -sf -H "X-API-Key: $APP_API_KEY" 'localhost:8080/calc/multiply?a=6&b=7'
+          echo
